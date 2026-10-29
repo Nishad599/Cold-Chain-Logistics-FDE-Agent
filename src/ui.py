@@ -84,7 +84,7 @@ with st.sidebar:
     st.image(str(script_dir / "image_L25X5q.png") if (script_dir / "image_L25X5q.png").exists() else "https://cdn-icons-png.flaticon.com/512/2830/2830305.png", width=65)
     st.title("FDE Command Center")
     
-    app_mode = st.radio("System Mode", ["🧊 Dispatch Console", "📊 Fleet Dashboard", "🛡️ Security & Audit Logs"])
+    app_mode = st.radio("System Mode", ["🧊 Dispatch Console", "📡 Live Telemetry", "📊 Historic Data", "🛡️ Security & Audit Logs"])
     
     st.markdown("---")
     st.caption(f"Session Token: `{st.session_state.thread_id[:8]}...`")
@@ -210,11 +210,66 @@ if app_mode == "🧊 Dispatch Console":
                 st.error(error_fallback)
 
 
-elif app_mode == "📊 Fleet Dashboard":
+elif app_mode == "📡 Live Telemetry":
     # ------------------------------------------
-    # TAB 2: HISTORIC FLEET KPIs (read-only view, same one the agent queries)
+    # TAB 2: LIVE KAFKA STREAM (readings stamped in the last few minutes)
     # ------------------------------------------
-    st.title("📊 Fleet Telemetry Dashboard")
+    st.title("📡 Live Fleet Telemetry")
+    st.caption("Kafka topic `fleet-telemetry` → Postgres → this page, refreshed every 2 seconds")
+
+    window_min = st.select_slider("Time window (minutes)", options=[5, 15, 30, 60], value=15)
+    limit_c = st.number_input("Temperature alert above (°C)", value=8.0, step=0.5)
+
+    # Only this fragment re-runs on the timer, so the rest of the page (and the chat) is untouched
+    @st.fragment(run_every="2s")
+    def live_panel():
+        with agent_engine.connect() as conn:
+            # event_time is stored as UTC without a time zone
+            live = pd.read_sql(text("""
+                SELECT event_time, latitude, longitude, current_temperature_c,
+                       cargo_condition_score, risk_classification, delay_probability
+                FROM fde_views.vw_fleet_history
+                WHERE event_time >= (now() AT TIME ZONE 'UTC') - make_interval(mins => :mins)
+                ORDER BY event_time DESC
+            """), conn, params={"mins": window_min})
+
+        if live.empty:
+            st.info("No live readings in this window. Start the stream: `docker compose up -d telemetry-producer telemetry-consumer`")
+            return
+
+        breaches = live[live["current_temperature_c"] > limit_c]
+        last_age = (pd.Timestamp.utcnow().tz_localize(None) - live["event_time"].iloc[0]).total_seconds()
+
+        c1, c2, c3, c4 = st.columns(4)
+        c1.metric("Readings in window", f"{len(live):,}")
+        c2.metric("Latest temp", f"{live['current_temperature_c'].iloc[0]:.1f} °C")
+        c3.metric(f"Above {limit_c:g} °C", f"{len(breaches):,}")
+        c4.metric("Last reading", f"{last_age:.0f} s ago")
+
+        left, right = st.columns(2)
+        with left:
+            st.subheader("Cargo temperature (°C)")
+            st.line_chart(live, x="event_time", y="current_temperature_c")
+        with right:
+            st.subheader("Latest positions")
+            st.map(live.head(100), latitude="latitude", longitude="longitude", size=20000)
+
+        st.subheader("Latest readings")
+        st.dataframe(
+            live.head(25).style.apply(
+                lambda r: ["background-color: #7F1D1D" if r["current_temperature_c"] > limit_c else ""] * len(r), axis=1
+            ),
+            hide_index=True, use_container_width=True,
+        )
+
+    live_panel()
+
+
+elif app_mode == "📊 Historic Data":
+    # ------------------------------------------
+    # TAB 3: HISTORIC FLEET KPIs + DATA BROWSER (read-only view, same one the agent queries)
+    # ------------------------------------------
+    st.title("📊 Historic Fleet Data")
 
     # Aggregate inside Postgres so only a few rows travel to the app; cache for 60s
     # so switching tabs does not re-run the queries.
@@ -268,6 +323,31 @@ elif app_mode == "📊 Fleet Dashboard":
 
     st.subheader("Monthly average delay probability")
     st.line_chart(monthly, x="month", y="avg_delay_probability")
+
+    st.markdown("---")
+    st.subheader("🔎 Browse readings")
+    f1, f2, f3 = st.columns([2, 2, 1])
+    with f1:
+        date_range = st.date_input("Date range", value=(pd.Timestamp("2024-08-01").date(), pd.Timestamp("2024-08-29").date()))
+    with f2:
+        risk_pick = st.multiselect("Risk class", risk["risk_classification"].tolist(), default=risk["risk_classification"].tolist())
+    with f3:
+        max_rows = st.selectbox("Max rows", [500, 2000, 5000], index=1)
+
+    # The date picker returns one date while the user is still choosing the second one
+    if len(date_range) == 2 and risk_pick:
+        with agent_engine.connect() as conn:
+            rows = pd.read_sql(text("""
+                SELECT event_time, latitude, longitude, current_temperature_c, cargo_condition_score,
+                       risk_classification, delay_probability, port_congestion_level, route_risk_index
+                FROM fde_views.vw_fleet_history
+                WHERE event_time >= :start AND event_time < CAST(:end AS DATE) + 1
+                  AND risk_classification = ANY(:risks)
+                ORDER BY event_time DESC
+                LIMIT :n
+            """), conn, params={"start": date_range[0], "end": date_range[1], "risks": risk_pick, "n": max_rows})
+        st.caption(f"{len(rows):,} rows (newest first, capped at {max_rows:,}). Use the table's download icon to export CSV.")
+        st.dataframe(rows, hide_index=True, use_container_width=True, height=450)
 
 
 elif app_mode == "🛡️ Security & Audit Logs":

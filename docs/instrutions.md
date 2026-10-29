@@ -90,7 +90,7 @@ I'm a new dispatcher on the night shift. Can you quickly explain the difference 
 docker compose up -d --build
 ```
 
-Open http://localhost:8501. The "Fleet Dashboard" page shows historic KPIs from the same read-only view the agent uses. The "Security & Audit Logs" page needs the `POSTGRES_USER` / `POSTGRES_PASSWORD` from `.env`.
+Open http://localhost:8501. "📡 Live Telemetry" shows the Kafka stream as it arrives (refreshes every 2 s); "📊 Historic Data" shows KPIs, charts and a filterable table of all readings. Both use the same read-only view the agent uses. The "Security & Audit Logs" page needs the `POSTGRES_USER` / `POSTGRES_PASSWORD` from `.env`.
 
 ## Phase 6: Simulate live telemetry with Kafka
 
