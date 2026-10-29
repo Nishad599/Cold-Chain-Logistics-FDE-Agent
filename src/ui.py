@@ -2,12 +2,11 @@ import os
 import sys
 import uuid
 import json
-import urllib
 from pathlib import Path
 from dotenv import load_dotenv
 import streamlit as st
 import pandas as pd
-from sqlalchemy import create_engine, text
+from sqlalchemy import text
 from langchain_core.messages import HumanMessage, ToolMessage
 
 # ==========================================
@@ -23,36 +22,21 @@ load_dotenv(project_root / ".env")
 
 # Import the compiled graph and tools list dynamically
 from src.orchestrator import fde_agent
+from src.db import get_engine
+from src.agent_tools import engine as agent_engine  # read-only fde_agent login, reused for the dashboard
 
 # ==========================================
-# 2. SQL CREDENTIALS MAPPING FROM .ENV
+# 2. AUDIT LOG CONNECTION
 # ==========================================
-db_host = os.getenv("SQL_SERVER_HOST", "localhost")
-db_port = os.getenv("SQL_SERVER_PORT", "1433")
-db_user = os.getenv("SQL_AGENT_USER", "USR_FDE_RO")
-db_password = os.getenv("SQL_AGENT_PASSWORD")
-
-# Engine for the Agent to write logs using its standard credentials
-connection_string = (
-    f"DRIVER={{ODBC Driver 18 for SQL Server}};"
-    f"SERVER={db_host},{db_port};"
-    f"DATABASE=master;"
-    f"UID={db_user};"
-    f"PWD={db_password};"
-    f"Encrypt=no;"
-    f"TrustServerCertificate=yes;"
-)
-
-log_params = urllib.parse.quote_plus(connection_string)
-
-log_engine = create_engine(f"mssql+pyodbc:///?odbc_connect={log_params}")
+# Separate login from the agent: fde_auditor can ONLY insert audit rows (it cannot read or change them)
+log_engine = get_engine("fde_auditor", os.getenv("AUDIT_DB_PASSWORD"))
 
 def write_audit_log(session_id, node_name, tool_name, content):
-    """Silently writes agent execution traces to the SQL audit table using agent permissions."""
+    """Silently writes agent execution traces to the audit table using the insert-only login."""
     try:
         with log_engine.connect() as conn:
             conn.execute(text("""
-                INSERT INTO FDE_VIEWS.AgentAuditLog (SessionID, NodeExecuted, ToolName, Content)
+                INSERT INTO agent_audit_log (session_id, node_executed, tool_name, content)
                 VALUES (:session_id, :node_name, :tool_name, :content)
             """), {
                 "session_id": session_id,
@@ -100,7 +84,7 @@ with st.sidebar:
     st.image(str(script_dir / "image_L25X5q.png") if (script_dir / "image_L25X5q.png").exists() else "https://cdn-icons-png.flaticon.com/512/2830/2830305.png", width=65)
     st.title("FDE Command Center")
     
-    app_mode = st.radio("System Mode", ["🧊 Dispatch Console", "🛡️ Security & Audit Logs"])
+    app_mode = st.radio("System Mode", ["🧊 Dispatch Console", "📊 Fleet Dashboard", "🛡️ Security & Audit Logs"])
     
     st.markdown("---")
     st.caption(f"Session Token: `{st.session_state.thread_id[:8]}...`")
@@ -226,48 +210,99 @@ if app_mode == "🧊 Dispatch Console":
                 st.error(error_fallback)
 
 
+elif app_mode == "📊 Fleet Dashboard":
+    # ------------------------------------------
+    # TAB 2: HISTORIC FLEET KPIs (read-only view, same one the agent queries)
+    # ------------------------------------------
+    st.title("📊 Fleet Telemetry Dashboard")
+
+    # Aggregate inside Postgres so only a few rows travel to the app; cache for 60s
+    # so switching tabs does not re-run the queries.
+    @st.cache_data(ttl=60)
+    def load_dashboard():
+        with agent_engine.connect() as conn:
+            kpi = pd.read_sql("""
+                SELECT COUNT(*)                                      AS readings,
+                       AVG(current_temperature_c)                    AS avg_temp,
+                       AVG(delay_probability)                        AS avg_delay,
+                       AVG((risk_classification = 'High Risk')::int) AS high_risk_share
+                FROM fde_views.vw_fleet_history
+            """, conn).iloc[0]
+            risk = pd.read_sql("""
+                SELECT risk_classification, COUNT(*) AS readings
+                FROM fde_views.vw_fleet_history
+                GROUP BY 1
+            """, conn)
+            monthly = pd.read_sql("""
+                SELECT date_trunc('month', event_time)        AS month,
+                       AVG(current_temperature_c)             AS avg_temp_c,
+                       AVG(delay_probability)                 AS avg_delay_probability
+                FROM fde_views.vw_fleet_history
+                GROUP BY 1 ORDER BY 1
+            """, conn)
+        return kpi, risk, monthly
+
+    try:
+        kpi, risk, monthly = load_dashboard()
+    except Exception as e:
+        st.error(f"Dashboard query failed (is the database up and loaded?): {e}")
+        st.stop()
+
+    if kpi["readings"] == 0:
+        st.info("No telemetry yet. Run scripts/ingest_legacy_data.py first.")
+        st.stop()
+
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("Readings", f"{int(kpi['readings']):,}")
+    c2.metric("Avg cargo temp", f"{kpi['avg_temp']:.1f} °C")
+    c3.metric("Avg delay probability", f"{kpi['avg_delay']:.0%}")
+    c4.metric("High-risk readings", f"{kpi['high_risk_share']:.0%}")
+
+    left, right = st.columns(2)
+    with left:
+        st.subheader("Readings by risk class")
+        st.bar_chart(risk, x="risk_classification", y="readings")
+    with right:
+        st.subheader("Monthly average cargo temperature (°C)")
+        st.line_chart(monthly, x="month", y="avg_temp_c")
+
+    st.subheader("Monthly average delay probability")
+    st.line_chart(monthly, x="month", y="avg_delay_probability")
+
+
 elif app_mode == "🛡️ Security & Audit Logs":
     # ------------------------------------------
-    # TAB 2: AUDIT LOG VIEWER (REQUIRES ADMIN CREDENTIALS FROM .ENV OR INPUT)
+    # TAB 3: AUDIT LOG VIEWER (REQUIRES ADMIN CREDENTIALS FROM .ENV OR INPUT)
     # ------------------------------------------
     st.title("🛡️ Enterprise Agent Audit Trail")
-    st.caption("Secure database inspection of FDE_VIEWS.AgentAuditLog")
-    
+    st.caption("Secure database inspection of agent_audit_log")
+
     st.markdown("### Database Authorization Gate")
-    st.markdown("Enter high-privilege administrative credentials (defined in `.env` as `SQL_ADMIN_USER`) to query audit logs.")
-    
+    st.markdown("Enter the Postgres admin credentials (defined in `.env` as `POSTGRES_USER` / `POSTGRES_PASSWORD`) to query audit logs.")
+
     with st.form("admin_auth_form"):
         col1, col2 = st.columns(2)
         with col1:
-            input_user = st.text_input("Admin Username", value=os.getenv("SQL_ADMIN_USER", ""))
+            input_user = st.text_input("Admin Username", value=os.getenv("POSTGRES_USER", ""))
         with col2:
             input_pass = st.text_input("Admin Password", type="password", value="")
             
         submit_admin = st.form_submit_button("Authenticate & Load Logs", use_container_width=True)
 
     if submit_admin:
-        expected_admin_user = os.getenv("SQL_ADMIN_USER")
-        expected_admin_pass = os.getenv("SQL_ADMIN_PASSWORD")
-        
+        expected_admin_user = os.getenv("POSTGRES_USER")
+        expected_admin_pass = os.getenv("POSTGRES_PASSWORD")
+
         if input_user == expected_admin_user and input_pass == expected_admin_pass:
             try:
-                # Build an isolated admin connection string for viewing data
-                admin_params = urllib.parse.quote_plus(
-                    "DRIVER={ODBC Driver 18 for SQL Server};"
-                    f"SERVER={db_host},{db_port};"
-                    "DATABASE=master;"
-                    f"UID={input_user};"
-                    f"PWD={input_pass};"
-                    "Encrypt=no;"
-                    "TrustServerCertificate=yes;"
-                )
-                admin_engine = create_engine(f"mssql+pyodbc:///?odbc_connect={admin_params}")
-                
+                # Isolated admin connection, used only for viewing the audit trail
+                admin_engine = get_engine(input_user, input_pass)
+
                 with admin_engine.connect() as conn:
                     query = """
-                        SELECT LogID, Timestamp, SessionID, NodeExecuted, ToolName, Content 
-                        FROM FDE_VIEWS.AgentAuditLog 
-                        ORDER BY Timestamp DESC
+                        SELECT log_id, logged_at, session_id, node_executed, tool_name, content
+                        FROM agent_audit_log
+                        ORDER BY logged_at DESC
                     """
                     df = pd.read_sql(query, conn)
                 
@@ -277,12 +312,12 @@ elif app_mode == "🛡️ Security & Audit Logs":
                     st.dataframe(
                         df,
                         column_config={
-                            "LogID": st.column_config.NumberColumn("ID", format="%d"),
-                            "Timestamp": st.column_config.DatetimeColumn("Execution Time", format="DD/MM/YYYY-h:mm a"),
-                            "SessionID": "Session Token",
-                            "NodeExecuted": "Graph Node",
-                            "ToolName": "Tool Triggered",
-                            "Content": "Raw Payload Data"
+                            "log_id": st.column_config.NumberColumn("ID", format="%d"),
+                            "logged_at": st.column_config.DatetimeColumn("Execution Time", format="DD/MM/YYYY-h:mm a"),
+                            "session_id": "Session Token",
+                            "node_executed": "Graph Node",
+                            "tool_name": "Tool Triggered",
+                            "content": "Raw Payload Data"
                         },
                         hide_index=True,
                         use_container_width=True,

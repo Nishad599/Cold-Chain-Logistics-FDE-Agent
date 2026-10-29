@@ -54,10 +54,25 @@ elif AGENT_LLM_SETTING == "DEEPSEEK":
         # }
     )
 
+elif AGENT_LLM_SETTING == "GROQ":
+    # Groq's free tier (console.groq.com) speaks the OpenAI API, so ChatOpenAI works as-is
+    groq_model = os.getenv("GROQ_MODEL", "openai/gpt-oss-120b")
+    print(f"⚡ Brain Mode: Utilizing Groq Cloud Reasoner ({groq_model})...")
+    from langchain_openai import ChatOpenAI
+    llm = ChatOpenAI(
+        model=groq_model,
+        temperature=0,
+        openai_api_key=os.getenv("GROQ_API_KEY"),
+        base_url="https://api.groq.com/openai/v1",
+        max_tokens=2048,
+    )
+
 else:  # FALLBACK / DEFAULT RUNNER MODE
     print("🤗 Brain Mode: Local Fallback Activated. Binding Local Ollama (qwen2.5:7b)...")
-    from langchain_community.chat_models import ChatOllama
-    llm = ChatOllama(model="qwen2.5:7b", temperature=0, num_predict=1024)
+    from langchain_ollama import ChatOllama  # official package; langchain_community no longer ships ChatOllama
+    # Inside Docker, OLLAMA_BASE_URL points at the host machine (host.docker.internal)
+    llm = ChatOllama(model="qwen2.5:7b", temperature=0, num_predict=1024,
+                     base_url=os.getenv("OLLAMA_BASE_URL", "http://localhost:11434"))
 
 fde_tools = [query_telemetry_db, fetch_corridor_conditions, search_compliance_sop]
 llm_with_tools = llm.bind_tools(fde_tools)
@@ -65,8 +80,12 @@ llm_with_tools = llm.bind_tools(fde_tools)
 # ==========================================
 # 3. GRAPH ARCHITECTURE ASSEMBLY
 # ==========================================
+# The system prompt is added on EVERY model call (not stored in the chat state),
+# so both the terminal loop below and the Streamlit UI always get it.
+SYSTEM_PROMPT = SystemMessage(content=(project_root / "src" / "prompts" / "system_prompt.txt").read_text(encoding="utf-8"))
+
 def reasoning_node(state: AgentState):
-    response = llm_with_tools.invoke(state["messages"])
+    response = llm_with_tools.invoke([SYSTEM_PROMPT] + state["messages"])
     return {"messages": [response]}
 
 print("⚙️ Compiling LangGraph FDE Orchestrator...")
@@ -89,20 +108,8 @@ if __name__ == "__main__":
     print(f"   Configured Execution: [LLM: {AGENT_LLM_SETTING}] -> [Embeddings: {os.getenv('Embeddings_model', 'LOCAL')}]")
     print("="*55 + "\n")
     
-    # Load the business-structured system prompt from the external file
-    prompt_path = project_root / "src" / "prompts" / "system_prompt.txt"
-    try:
-        with open(prompt_path, "r", encoding="utf-8") as f:
-            system_instructions = f.read()
-    except FileNotFoundError:
-        print(f"Error: Could not find {prompt_path}")
-        system_instructions = "You are a helpful AI assistant." # Basic fallback
-
-    system_prompt = SystemMessage(content=system_instructions)
-    
     thread_config = {"configurable": {"thread_id": "production_test_1"}}
-    fde_agent.invoke({"messages": [system_prompt]}, config=thread_config)
-    
+
     while True:
         user_input = input("\nDispatcher > ")
         if user_input.lower() in ['exit', 'quit']:

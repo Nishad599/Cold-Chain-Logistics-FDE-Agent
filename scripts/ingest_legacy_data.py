@@ -1,66 +1,36 @@
+import os
+import sys
 from pathlib import Path
 import pandas as pd
-import urllib
-import os
-from sqlalchemy import create_engine
+from sqlalchemy import text
 from dotenv import load_dotenv
 
-# __file__ is 'experiment/phase-0/ingest_legacy_data.py'
-script_dir = Path(__file__).resolve().parent # points to experiment/phase-0
-project_root = script_dir.parents[0] # climbs up 1 levels to project root
-
+project_root = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(project_root))
 load_dotenv(project_root / ".env")
 
-data_path = project_root / "data" / "raw" / "dynamic_supply_chain_logistics_dataset.csv"
+from src.db import get_engine, LEGACY_MAPPING
 
-db_host = os.getenv("SQL_SERVER_HOST", "localhost")
-db_port = os.getenv("SQL_SERVER_PORT", "1433")
-db_user = os.getenv("SQL_ADMIN_USER")
-db_password = os.getenv("SQL_ADMIN_PASSWORD")
+data_path = project_root / "data" / "raw" / "dynamic_supply_chain_logistics_dataset.csv"
 
 # 1. Load the raw dataset
 print(f"Loading CSV from {data_path}...")
 df = pd.read_csv(data_path)
 
 # 2. Map clean columns to a messy 2000s legacy enterprise schema
-legacy_mapping = {
-    'timestamp': 'TS_UTC',
-    'vehicle_gps_latitude': 'V_LAT',
-    'vehicle_gps_longitude': 'V_LON',
-    'iot_temperature': 'IOT_TEMP_VAL_C',
-    'cargo_condition_status': 'CGO_COND_CD',
-    'risk_classification': 'RISK_CLS_TXT',
-    'delay_probability': 'DELAY_PROB_DEC',
-    'port_congestion_level': 'PRT_CNG_LVL',
-    'route_risk_level': 'RT_RSK_IDX'
-}
+df_legacy = df[list(LEGACY_MAPPING.keys())].rename(columns=LEGACY_MAPPING)
+df_legacy['ts_utc'] = pd.to_datetime(df_legacy['ts_utc'])
+df_legacy['sys_ingest_flag'] = 'Y'
 
-# Keep only the columns we mapped for this demo and rename them
-df_legacy = df[list(legacy_mapping.keys())].rename(columns=legacy_mapping)
+# 3. Connect as the Postgres admin (only the admin may write to the raw table)
+engine = get_engine(os.getenv("POSTGRES_USER"), os.getenv("POSTGRES_PASSWORD"))
 
-# Add a fake ingestion flag to make it look like an automated legacy system
-df_legacy['SYS_INGEST_FLAG'] = 'Y'
-
-# 3. Connect to Docker MSSQL Server
-print("Connecting to legacy MSSQL Database...")
-# Use the pyodbc driver. (Ensure you have ODBC Driver 17 or 18 for SQL Server installed on your OS)
-connection_string = (
-        f"DRIVER={{ODBC Driver 18 for SQL Server}};"
-        f"SERVER={db_host},{db_port};"
-        f"DATABASE=master;"
-        f"UID={db_user};"
-        f"PWD={db_password};"
-        f"Encrypt=no;"
-        f"TrustServerCertificate=yes;"
-    )
-
-params = urllib.parse.quote_plus(connection_string)
-
-engine = create_engine(f"mssql+pyodbc:///?odbc_connect={params}")
-
-# 4. Ingest data into the messy table name
-table_name = 'TBL_SC_FLEET_HIST_RAW'
-print(f"Ingesting into {table_name}. This may take a minute...")
-df_legacy.to_sql(table_name, engine, if_exists='replace', index=False, schema='dbo')
+# 4. Reload the table. TRUNCATE + append (not if_exists='replace'), because
+#    'replace' would DROP the table, and the agent's view depends on it.
+table_name = 'tbl_sc_fleet_hist_raw'
+print(f"Ingesting {len(df_legacy)} rows into {table_name}...")
+with engine.begin() as conn:
+    conn.execute(text(f"TRUNCATE {table_name}"))
+    df_legacy.to_sql(table_name, conn, if_exists='append', index=False)
 
 print("✅ Legacy data ingestion complete!")

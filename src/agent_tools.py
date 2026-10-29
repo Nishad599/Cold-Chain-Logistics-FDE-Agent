@@ -1,23 +1,23 @@
 import os
-import urllib
+import sys
 import requests
 from pathlib import Path
 from dotenv import load_dotenv
-from sqlalchemy import create_engine, text
+from sqlalchemy import text
 
 from langchain_core.tools import tool
 from langchain_openai import OpenAIEmbeddings
-from langchain_pinecone import PineconeVectorStore
 
 # ==========================================
-# 1. ENVIRONMENT & DYNAMIC INDEX ATTACHMENT
+# 1. ENVIRONMENT & EMBEDDINGS
 # ==========================================
 script_dir = Path(__file__).resolve().parent
-project_root = script_dir.parent  
+project_root = script_dir.parent
+sys.path.insert(0, str(project_root))
 
 load_dotenv(dotenv_path=project_root / ".env")
 
-PINECONE_API_KEY = os.getenv("PINECONE_API_KEY")
+from src.db import get_engine
 
 
 def get_cached_huggingface_embeddings(model_name: str):
@@ -40,22 +40,18 @@ def get_cached_huggingface_embeddings(model_name: str):
 
 EMBEDDINGS_MODEL_SETTING = os.getenv("Embeddings_model", "LOCAL").strip().upper()
 
-db_host = os.getenv("SQL_SERVER_HOST", "localhost")
-db_port = os.getenv("SQL_SERVER_PORT", "1433")
-db_user = os.getenv("SQL_AGENT_USER", "USR_FDE_RO")
-db_password = os.getenv("SQL_AGENT_PASSWORD")
+# The agent connects as fde_agent: it can SELECT the fleet view and SOP chunks, nothing else.
+# This is the real security boundary; the SELECT check in the tool below is only a first filter.
+engine = get_engine("fde_agent", os.getenv("AGENT_DB_PASSWORD"))
 
-if not PINECONE_API_KEY:
-    raise ValueError("CRITICAL: Ensure PINECONE_API_KEY is present in your active .env profile.")
-
+# Must be the same embedding model used by scripts/ingest_sop_pgvector.py
 if EMBEDDINGS_MODEL_SETTING == "OPENAI":
-    print("🤖 Mode: Connecting to Cloud OpenAI Index (1536 Dim Space)...")
+    print("🤖 Mode: OpenAI Embeddings (1536 Dim Space)...")
     embeddings = OpenAIEmbeddings()
-    INDEX_NAME = "fde-sop-index-openai"
 else :
     local_model_target = os.getenv("Local_Embedding_Model", "BAAI/bge-m3").strip()
-    
-    print(f"🤗 Mode: Connecting to Local Fallback [{local_model_target}] Index (1024 Dim Space)...")
+
+    print(f"🤗 Mode: Local Embeddings [{local_model_target}] (1024 Dim Space)...")
 
     try:
         import streamlit as st
@@ -68,11 +64,6 @@ else :
         from langchain_huggingface import HuggingFaceEmbeddings
         embeddings = HuggingFaceEmbeddings(model_name=local_model_target, model_kwargs={'device': 'cpu'})
 
-    INDEX_NAME = "fde-sop-index-local"
-
-vector_store = PineconeVectorStore(index_name=INDEX_NAME, embedding=embeddings)
-retriever = vector_store.as_retriever(search_kwargs={"k": 2})
-
 # ==========================================
 # 2. CORE FDE AGENT TOOLS
 # ==========================================
@@ -80,26 +71,12 @@ retriever = vector_store.as_retriever(search_kwargs={"k": 2})
 @tool
 def query_telemetry_db(sql_query: str) -> str:
     """
-    Executes a SQL SELECT query against the FDE_VIEWS.VW_ACTIVE_FLEET view.
+    Executes a SQL SELECT query against the fde_views.vw_fleet_history view.
     Columns available:
-    Timestamp, Latitude, Longitude, Current_Temperature_C, Cargo_Condition_Code,
-    Risk_Classification, Delay_Probability, Port_Congestion_Level, Route_Risk_Index.
-    Always write standard T-SQL queries.
+    event_time, latitude, longitude, current_temperature_c, cargo_condition_score,
+    risk_classification, delay_probability, port_congestion_level, route_risk_index.
+    Always write PostgreSQL queries (use LIMIT, not TOP).
     """
-    connection_string = (
-            f"DRIVER={{ODBC Driver 18 for SQL Server}};"
-            f"SERVER={db_host},{db_port};"
-            f"DATABASE=master;"
-            f"UID={db_user};"
-            f"PWD={db_password};"
-            f"Encrypt=no;"
-            f"TrustServerCertificate=yes;"
-        )
-
-    params = urllib.parse.quote_plus(connection_string)
-    
-    engine = create_engine(f"mssql+pyodbc:///?odbc_connect={params}")
-    
     try:
         if not sql_query.strip().upper().startswith("SELECT"):
             return "SECURITY BLOCK: Only SELECT operations are authorized on this view."
@@ -151,16 +128,25 @@ def fetch_corridor_conditions(latitude: float, longitude: float) -> str:
 @tool
 def search_compliance_sop(query: str) -> str:
     """
-    Searches enterprise Standard Operating Procedures (SOPs) indexed in the Pinecone Vector DB.
+    Searches enterprise Standard Operating Procedures (SOPs) stored in the pgvector database.
     Use this to retrieve regulatory thresholds, cold-chain breach mitigations, and rerouting rules.
     """
     try:
-        matched_docs = retriever.invoke(query)
-        if not matched_docs:
+        query_vector = embeddings.embed_query(query)
+        with engine.connect() as conn:
+            # "<=>" is pgvector's cosine distance: smallest = most similar. Top 2 chunks, like before.
+            matched = conn.execute(text("""
+                SELECT source_file, metadata->>'file_format', content
+                FROM sop_chunks
+                ORDER BY embedding <=> CAST(:q AS VECTOR)
+                LIMIT 2
+            """), {"q": str(query_vector)}).fetchall()
+
+        if not matched:
             return "No matching compliance clauses found."
-            
+
         formatted_context = "\n\n".join(
-            [f"[Source: {doc.metadata.get('source_file', 'SOP')} | Format: {doc.metadata.get('file_format', 'RAW')}]\n{doc.page_content}" for doc in matched_docs]
+            [f"[Source: {source} | Format: {fmt}]\n{content}" for source, fmt, content in matched]
         )
         return f"--- COMPLIANCE SOP CONTEXT ---\n{formatted_context}\n------------------------------"
     except Exception as e:
@@ -171,10 +157,10 @@ def search_compliance_sop(query: str) -> str:
 # ==========================================
 if __name__ == "__main__":
     print("\n--- Testing Tool 1: SQL Telemetry View ---")
-    print(query_telemetry_db.invoke("SELECT TOP 2 Latitude, Longitude, Current_Temperature_C FROM FDE_VIEWS.VW_ACTIVE_FLEET"))
+    print(query_telemetry_db.invoke("SELECT latitude, longitude, current_temperature_c FROM fde_views.vw_fleet_history LIMIT 2"))
     
     print("\n--- Testing Tool 2: Live Corridor API ---")
     print(fetch_corridor_conditions.invoke({"latitude": 33.77, "longitude": -118.19}))
     
-    print("\n--- Testing Tool 3: Pinecone Vector Retrieval ---")
+    print("\n--- Testing Tool 3: pgvector SOP Retrieval ---")
     print(search_compliance_sop.invoke("What are the temperature rules for fresh perishables?"))

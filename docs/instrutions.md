@@ -1,209 +1,125 @@
-# Phase 0
+# Cold-Chain FDE Project: Local Setup (Docker Desktop)
 
-## Ingesting data
+Everything runs on your machine. No cloud account is needed except, optionally, an LLM API key.
 
-- Download the dataset from 'data\source\data.txt'
-- Create and EC2 instance > docker container > mcr.microsoft.com/mssql/server:2022-latest
-- Spin up the Legacy MSSQL Server
-```
-docker run -e "ACCEPT_EULA=Y" -e "MSSQL_SA_PASSWORD=FdeEnterprisePass123!" -p 1433:1433 --name legacy-mssql -d mcr.microsoft.com/mssql/server:2022-latest
+| Piece | Where it runs |
+|---|---|
+| Postgres 16 + pgvector (fleet data, SOP vectors, audit log) | `db` container |
+| Streamlit UI + LangGraph agent | `app` container |
+| Live telemetry stream (Kafka, KRaft single node) | `kafka`, `telemetry-producer`, `telemetry-consumer` containers |
+| LLM (default `qwen2.5:7b`) | Ollama on the host, or Groq's free API |
+| Weather | Open-Meteo public API (free, no key) |
 
-# or multi-line in windows 
-docker run -e "ACCEPT_EULA=Y" -e "MSSQL_SA_PASSWORD=FdeEnterprisePass123!" ^
-   -p 1433:1433 --name legacy-mssql ^
-   -d mcr.microsoft.com/mssql/server:2022-latest
+## Phase 0: Prerequisites
 
-# or multi-line unix
-docker run -e "ACCEPT_EULA=Y" -e "MSSQL_SA_PASSWORD=FdeEnterprisePass123!" \
-   -p 1433:1433 --name legacy-mssql \
-   -d mcr.microsoft.com/mssql/server:2022-latest
+1. Install and start **Docker Desktop**.
+2. Install **Ollama** (https://ollama.com), then run `ollama pull qwen2.5:7b`.
+   Or, with no install: get a free key at https://console.groq.com/keys, then in `.env` set
+   `Agent_llm=GROQ` and `GROQ_API_KEY=...`. (`DEEPSEEK` / `OPENAI` also work with their keys.)
+3. Install the Python packages on the host (used by the ingest scripts):
+   `pip install -r requirements.txt`
+4. Create `.env` from the template and set your own passwords:
+   `copy .env.example .env`
 
-# or multi-line with volume inside EC2
-docker run -v mssql_data:/var/opt/mssql \
-  -e "ACCEPT_EULA=Y" \
-  -e "MSSQL_SA_PASSWORD=FdeEnterprisePass123!" \
-  -p 1433:1433 \
-  --name legacy-mssql \
-  -d mcr.microsoft.com/mssql/server:2022-latest
+## Phase 1: Start the database
 
 ```
-- install the req > pip install -r requirements.txt
-
-- python scripts\ingest_legacy_data.py
-
-## Connecting to the data 
-
-We need to query the database
-- Download : https://github.com/microsoft/azuredatastudio
-   - https://learn.microsoft.com/en-us/previous-versions/azure-data-studio/download-azure-data-studio?tabs=win-install%2Cwin-user-install%2Credhat-install%2Cwindows-uninstall%2Credhat-uninstall
-- The recommendation is to use VS code extension : "SQL Server (mssql)" by microsoft
-   - Click on icon that looks like server or refrigarator, not the one with cylinder 
-   - Add connection
-   - Fill the below :
-   ```
-   Profile Name: legacy-mssql
-   Server name*: localhost
-   Port: 1433
-   Trust server certificate: 🟩 Check this box / turn it ON (Crucial for Docker)
-   Authentication type*: SQL Login
-   User name*: sa
-   Password*: FdeEnterprisePass123!
-   Save Password: 🟩 Check this box
-   Database name: Type master (or leave it on "Select a database")
-   Encrypt: ⚠️ Change this from Mandatory to Optional (or False)
-   ```
-
-- CTRL + N
-- SQL
-- SELECT COUNT(*) AS total_rows FROM dbo.TBL_SC_FLEET_HIST_RAW;
-
-## instruction for Ec2 instance > datbase
-- Instance type : c7i-flex.large
-- storage : 30 gb
-- ubuntu (linux)
-- Security group > attach the security while creating ec2 instance
-- Launch instance
-- SSH using .pem file from your system
-- install the docker
-- 
-```
-docker run -v mssql_data:/var/opt/mssql \
-  -e "ACCEPT_EULA=Y" \
-  -e "MSSQL_SA_PASSWORD=FdeEnterprisePass123!" \
-  -p 1433:1433 \
-  --name legacy-mssql \
-  -d mcr.microsoft.com/mssql/server:2022-latest
-```
-- copy the ip address of the ec2 (public)
-
-# Phase 1
-
-## SOP Ingestion
-
-- https://app.pinecone.io/ > get api key
-- Use it in .env
-- run python scripts\ingest_sop_pinecone.py
-
-# Phase 2
-
-## Data Security
-
-- Click on file : scripts\setup_security_and_view.sql
-- VS-code will show you Start button directly on top else run like we were running the commands previously.
-- Once done, create a new connection now with Agent-Profile
-```
-* Profile Name: agent-fde-ro
-* Connection Group: Leave it on <Default>
-* Input type: Select Parameters (Do not click "Load from Connection String", "Browse Azure", or "Browse Fabric")
-* Server name*: localhost
-* Port: 1433
-* Trust server certificate: 🟩 Check this box / Turn it ON
-* Authentication type*: SQL Login
-* User name*: USR_FDE_RO
-* Password*: AgentPassword2026!
-* Save Password: 🟩 Check this box / Turn it ON
-* Database name: Type master (or click "Select a database" and select master)
-* Encrypt: Change this from Mandatory to Optional (or False)
+docker compose up -d db
 ```
 
-Connect and test below commands :
+On the **first** start, `db/init/01_init.sh` runs automatically and creates:
+
+- `tbl_sc_fleet_hist_raw`: the "legacy" raw table (cryptic column names)
+- `fde_views.vw_fleet_history`: the clean view, the only fleet object the agent can read
+- `sop_chunks`: SOP text + embeddings (replaces Pinecone)
+- `agent_audit_log`: append-only trail of every agent step
+- Logins: `fde_agent` (read-only view + SOP) and `fde_auditor` (insert-only audit log)
+- `db/init/02_ingestor.sh` adds `fde_ingestor` (insert-only raw table, used by the Kafka consumer)
+
+> The init script runs only when the data volume is empty. To start over from scratch:
+> `docker compose down -v` (this deletes all DB data).
+
+## Phase 2: Load the data
+
 ```
--- TEST 1: This SHOULD work perfectly (Access to clean view)
-SELECT TOP 5 * FROM FDE_VIEWS.VW_ACTIVE_FLEET;
-
--- TEST 2: This SHOULD fail instantly (Access to raw legacy table is DENIED)
-SELECT TOP 5 * FROM dbo.TBL_SC_FLEET_HIST_RAW;
+python scripts\ingest_legacy_data.py
+python scripts\ingest_sop_pgvector.py
 ```
 
-## Phase 3
+The first SOP run downloads the `bge-m3` embedding model (~2 GB, once).
+Re-running the SOP script skips files whose content hasn't changed.
 
-run src\agent_tools.py
-run src\orchestrator.py
+## Phase 3: Check the security model
 
-Step-1 : Pass below in the dispatcher >
-- Question-1 (The "Domino Effect" Test)
+```
+docker compose exec db psql -U fde_agent -d fde
+```
+
+```sql
+-- TEST 1: works (clean view)
+SELECT * FROM fde_views.vw_fleet_history LIMIT 5;
+
+-- TEST 2: fails with "permission denied" (raw legacy table)
+SELECT * FROM tbl_sc_fleet_hist_raw LIMIT 5;
+
+-- TEST 3: fails (the agent's session is read-only)
+DELETE FROM sop_chunks;
+```
+
+Optional GUI: the VS Code "PostgreSQL" extension, host `127.0.0.1`, port = `PG_PORT` from `.env`, database `fde`.
+
+## Phase 4: Test the agent in the terminal
+
+```
+python src\agent_tools.py      # runs each tool once
+python src\orchestrator.py     # chat loop: type exit to quit
+```
+
+- Question 1 (the "domino effect" test: should use all three tools)
 ```
 Find any active shipments near Los Angeles (Latitude ~33.8, Longitude ~-118.1). Check the local weather there, and tell me if the current cargo temperature violates the SOP for fresh perishables.
 ```
-
-- Question-2 (The "Restraint" Test (No-Tool Routing))
+- Question 2 (the "restraint" test: should not query telemetry)
 ```
 I'm a new dispatcher on the night shift. Can you quickly explain the difference between a Tier 1 and Tier 2 escalation?
 ```
 
+## Phase 5: Run the app
 
-## Phase 4
-Go to VS-code > CTRL + N > 'click on plain-text' and use 'sql'
-
-Select the su user and write below :
-
-CREATE TABLE FDE_VIEWS.AgentAuditLog (
-    LogID INT IDENTITY(1,1) PRIMARY KEY,
-    Timestamp DATETIME DEFAULT GETDATE(),
-    SessionID VARCHAR(50),
-    NodeExecuted VARCHAR(50),
-    ToolName VARCHAR(100),
-    Content NVARCHAR(MAX) -- NVARCHAR to safely handle JSON strings and large LLM outputs
-);
-
--- Grant the agent user permission to write only to this specific table
 ```
-GRANT INSERT ON FDE_VIEWS.AgentAuditLog TO USR_FDE_RO;
+docker compose up -d --build
 ```
 
-## Phase 5
-streamlit run src\ui.py
+Open http://localhost:8501. The "Fleet Dashboard" page shows historic KPIs from the same read-only view the agent uses. The "Security & Audit Logs" page needs the `POSTGRES_USER` / `POSTGRES_PASSWORD` from `.env`.
 
-## Phase 6
-- Deployment
+## Phase 6: Simulate live telemetry with Kafka
+
+`docker compose up -d --build` (Phase 5) also starts the stream:
+
 ```
-sudo apt update && sudo apt install -y python3-pip python3-venv git
-cd /home/ubuntu
-git clone https://github.com/nimowhyca/cold-chain-logistics-FDE-Project.git
-cd cold-chain-logistics-FDE-Project
-python3 -m venv venv
-source venv/bin/activate
-pip install -r requirements.txt
-streamlit run src/ui.py
+telemetry-producer  ->  Kafka topic "fleet-telemetry"  ->  telemetry-consumer  ->  tbl_sc_fleet_hist_raw
 ```
 
-1. Add the Microsoft GPG repository key
-curl -fsSL https://packages.microsoft.com/keys/microsoft.asc | sudo gpg --dearmor -o /usr/share/keyrings/microsoft-prod.gpg
+- The producer replays the dataset as a fake IoT gateway: one reading per second
+  (`TELEMETRY_RATE` in `.env`), stamped with the current UTC time, looping forever.
+- The consumer writes each reading into the raw table as `fde_ingestor` and marks it `sys_ingest_flag = 'K'`.
+- The agent needs no change: it reads the same view, which now keeps growing.
 
-2. Add the Microsoft SQL Server Ubuntu repository
-curl -fsSL https://packages.microsoft.com/config/ubuntu/$(lsb_release -rs)/prod.list | sudo tee /etc/apt/sources.list.d/mssql-release.list
+If your database volume existed before this step, create the ingestor login once:
 
-3. Update apt and install the driver (Accepting the EULA)
-sudo apt-get update
-sudo ACCEPT_EULA=Y apt-get install -y msodbcsql18
-
-4. Install the unixODBC development headers
-sudo apt-get install -y unixodbc-dev
-
-5. Create the systemd service file
 ```
-sudo nano /etc/systemd/system/streamlit.service
+docker compose exec db bash /docker-entrypoint-initdb.d/02_ingestor.sh
 ```
 
-6. Paste the configuration
+Watch it work:
+
 ```
-[Unit]
-Description=Streamlit Cold-Chain Dispatch Console
-After=network.target
-
-[Service]
-User=ubuntu
-WorkingDirectory=/home/ubuntu/cold-chain-logistics-FDE-Project
-ExecStart=/home/ubuntu/cold-chain-logistics-FDE-Project/venv/bin/streamlit run src/ui.py --server.port=8501 --server.address=0.0.0.0
-Restart=always
-
-[Install]
-WantedBy=multi-user.target
+docker compose logs -f telemetry-consumer
+docker compose exec db psql -U postgres -d fde -c "SELECT count(*), max(ts_utc) FROM tbl_sc_fleet_hist_raw WHERE sys_ingest_flag = 'K';"
 ```
 
-7. Register and start the service
-```
-sudo systemctl daemon-reload
-sudo systemctl enable streamlit
-sudo systemctl start streamlit
-```
+Try asking the agent: *"What are the 5 most recent readings and are any of them above 8 °C?"*
+
+To run the producer or consumer on the host instead: `python scripts\telemetry_producer.py` (uses `KAFKA_BOOTSTRAP=127.0.0.1:29092`).
+
+Without Docker for the app (for quick code changes): `streamlit run src\ui.py`
